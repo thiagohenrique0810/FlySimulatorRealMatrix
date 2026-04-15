@@ -173,7 +173,7 @@ class BaseWorld(BaseCompositionElement, ABC):
             internal_jointid = mj.mj_name2id(
                 mj_model, mj.mjtObj.mjOBJ_JOINT, joint_element.full_identifier
             )
-            dofadr_start = mj_model.jnt_dofadr[internal_jointid]
+            dofadr_start = mj_model.jnt_qposadr[internal_jointid]
             dofadr_end = dofadr_start + _STATE_DIM_BY_JOINT_TYPE[joint_type]
             neutral_qpos[dofadr_start:dofadr_end] = neutral_state
 
@@ -301,7 +301,7 @@ class FlatGroundWorld(BaseWorld):
                 "pair",
                 geom1=body_geom,
                 geom2=self.ground_geom,
-                name=f"{body_segment.name}-ground",
+                name=f"{fly.name}_{body_segment.name}-ground",
                 friction=ground_contact_params.get_friction_tuple(),
                 solref=ground_contact_params.get_solref_tuple(),
                 solimp=ground_contact_params.get_solimp_tuple(),
@@ -311,7 +311,8 @@ class FlatGroundWorld(BaseWorld):
     def _add_ground_contact_sensors(
         self, fly: Fly, bodysegs_with_ground_contact: list[BodySegment]
     ) -> None:
-        self.legpos_to_groundcontactsensors_by_fly = defaultdict(dict)
+        if self.legpos_to_groundcontactsensors_by_fly is None:
+            self.legpos_to_groundcontactsensors_by_fly = defaultdict(dict)
         contact_geoms_by_leg = defaultdict(list)
         for bodyseg in bodysegs_with_ground_contact:
             if bodyseg.is_leg():
@@ -326,7 +327,7 @@ class FlatGroundWorld(BaseWorld):
                 num=1,
                 reduce="netforce",
                 data="found force torque pos normal tangent",
-                name=f"ground_contact_{leg}_leg",
+                name=f"{fly.name}_ground_contact_{leg}_leg",
             )
             self.legpos_to_groundcontactsensors_by_fly[fly.name][leg] = sensor
 
