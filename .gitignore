@@ -1,6 +1,7 @@
 MUJOCO_LOG.TXT
 demo_output/
 gpu_benchmark_results*/
+external/
 
 .idea/
 

@@ -194,6 +194,26 @@ cd ~/Desktop/www/flygym-v1
 # Saída: outputs/grooming.mp4
 ```
 
+#### Jumping — salto balístico — FlyGym v1
+
+A mosca caminha, desacelera, agacha (crouch) e executa um salto explosivo de ~13 mm de altura (~6× o comprimento do corpo), depois aterrissa e retoma a caminhada. A máquina de estados inclui 9 fases (WALK → DECELERATE → CROUCH → LAUNCH → AIRBORNE → LAND → STABILIZE → ACCELERATE → RESUME_WALK). Estabilização giroscópica previne rotação durante o voo.
+
+```bash
+cd ~/Desktop/www/flygym-v1
+.venv/bin/python run_jumping.py
+# Saída: outputs/jumping.mp4, outputs/jumping_height.png
+```
+
+#### Pheromone Trail — trilha de feromônio — FlyGym v1
+
+A mosca segue uma trilha em S composta por 15 fontes de odor de intensidade crescente, simulando uma trilha de feromônio deixada por um explorador. Usando navegação olfativa bilateral (antenas), a mosca rastreia a curva sinusoidal (±4 mm de amplitude, 25 mm de extensão) até alcançar a fonte de comida no final da trilha.
+
+```bash
+cd ~/Desktop/www/flygym-v1
+.venv/bin/python run_pheromone_trail.py
+# Saída: outputs/pheromone_trail.mp4, outputs/pheromone_trajectory.png
+```
+
 ---
 
 ### Diferenças entre v1 e v2
