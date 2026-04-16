@@ -24,9 +24,14 @@ from flygym.brain.connectome import (
     Connectome,
     MN9_FLYWIRE_ID,
     SUGAR_SENSING_RIGHT_IDS,
+    OLFACTORY_PROXY_IDS,
     WALKING_SEZ_TYPES,
     GROOMING_SEZ_TYPES,
     FEEDING_SEZ_TYPES,
+    OLFACTORY_SEZ_TYPES,
+    ESCAPE_SEZ_TYPES,
+    FREEZING_SEZ_TYPES,
+    BACKWARD_SEZ_TYPES,
 )
 from flygym.brain.lif_model import OnlineBrainModel
 from flygym.brain.bridge import (
@@ -37,6 +42,10 @@ from flygym.brain.bridge import (
     WalkingPatternGenerator,
     GroomingProgram,
     FeedingProgram,
+    OdorSearchProgram,
+    EscapeProgram,
+    FreezingProgram,
+    BackwardProgram,
     reorder_cpg_to_actuator,
 )
 from flygym.brain.visualizer import BrainVisualizer
@@ -64,18 +73,29 @@ def main() -> None:
 
     sensory_ids = [s for s in SUGAR_SENSING_RIGHT_IDS
                    if s in connectome._flyid_to_idx]
+    # Add olfactory proxy neurons to the sensory pool
+    olfactory_ids = [o for o in OLFACTORY_PROXY_IDS
+                     if o in connectome._flyid_to_idx]
+    sensory_ids = sensory_ids + olfactory_ids
+
     walking_ids = [MN9_FLYWIRE_ID] + _collect_ids(connectome, WALKING_SEZ_TYPES)
     grooming_ids = _collect_ids(connectome, GROOMING_SEZ_TYPES)
     feeding_ids = _collect_ids(connectome, FEEDING_SEZ_TYPES)
+    olfactory_motor_ids = _collect_ids(connectome, OLFACTORY_SEZ_TYPES)
+    escape_ids = _collect_ids(connectome, ESCAPE_SEZ_TYPES)
+    freezing_ids = _collect_ids(connectome, FREEZING_SEZ_TYPES)
+    backward_ids = _collect_ids(connectome, BACKWARD_SEZ_TYPES)
 
     all_motor_ids: list[int] = []
     seen: set[int] = set()
-    for mid in walking_ids + grooming_ids + feeding_ids:
+    for mid in (walking_ids + grooming_ids + feeding_ids
+                + olfactory_motor_ids + escape_ids + freezing_ids + backward_ids):
         if mid not in seen and mid in connectome._flyid_to_idx:
             seen.add(mid)
             all_motor_ids.append(mid)
 
-    print(f"  {len(sensory_ids)} sensory, {len(all_motor_ids)} motor neurons")
+    print(f"  {len(sensory_ids)} sensory ({len(olfactory_ids)} olfactory), "
+          f"{len(all_motor_ids)} motor neurons")
 
     # ---------------------------------------------------------------
     print("Building brain model...")
@@ -128,6 +148,10 @@ def main() -> None:
         walking_ids=walking_ids,
         grooming_ids=grooming_ids,
         feeding_ids=feeding_ids,
+        olfactory_ids=olfactory_motor_ids,
+        escape_ids=escape_ids,
+        freezing_ids=freezing_ids,
+        backward_ids=backward_ids,
         hold_time_s=1.5,
         grooming_threshold=0.2,   # low — grooming pool has few neurons
         feeding_threshold=0.15,
@@ -151,6 +175,10 @@ def main() -> None:
     walk_cpg = WalkingPatternGenerator()
     groom_prog = GroomingProgram(grooming_freq=3.0)
     feed_prog = FeedingProgram(tap_freq=2.0)
+    odor_prog = OdorSearchProgram(cast_freq=1.5, cast_amplitude=0.6)
+    escape_prog = EscapeProgram(burst_speed=2.0, turn_magnitude=0.8)
+    freeze_prog = FreezingProgram()
+    backward_prog = BackwardProgram(reverse_speed=0.5, pivot_rate=0.4)
 
     # ---------------------------------------------------------------
     sim.reset()
@@ -158,6 +186,10 @@ def main() -> None:
     walk_cpg.reset()
     groom_prog.reset()
     feed_prog.reset()
+    odor_prog.reset()
+    escape_prog.reset()
+    freeze_prog.reset()
+    backward_prog.reset()
     beh_ctrl.reset()
     events.reset(seed=42)
     sim.warmup(duration_s=0.02)
@@ -173,13 +205,17 @@ def main() -> None:
     print("  Brain-driven fly — close the viewer window to stop")
     print()
     print("  The brain now controls:")
-    print("    • Behaviour switching (walk/groom/feed)")
+    print("    • Behaviour switching (walk/groom/feed/search/escape/freeze/reverse)")
     print("    • Per-leg stepping speed (6 independent legs)")
     print("    • Joint posture modulation (stride/height)")
     print()
     print("  Environmental events trigger behaviour changes:")
     print("    • Antenna dust → grooming")
     print("    • Sugar encounter → feeding")
+    print("    • Odor plume → chemotaxis search")
+    print("    • Ground vibration → startle escape")
+    print("    • Shadow overhead → freezing")
+    print("    • Frontal collision → backward retreat")
     print("    • Quiet periods → walking")
     print("=" * 58)
 
@@ -223,6 +259,18 @@ def main() -> None:
                     elif ev == "sugar_detection":
                         brain.inject_motor_current(
                             beh_ctrl._feeding_local, 18.0)
+                    elif ev == "odor_detection":
+                        brain.inject_motor_current(
+                            beh_ctrl._olfactory_local, 18.0)
+                    elif ev == "vibration_threat":
+                        brain.inject_motor_current(
+                            beh_ctrl._escape_local, 22.0)
+                    elif ev == "shadow_overhead":
+                        brain.inject_motor_current(
+                            beh_ctrl._freezing_local, 18.0)
+                    elif ev == "frontal_collision":
+                        brain.inject_motor_current(
+                            beh_ctrl._backward_local, 20.0)
 
                     # 4) Inject into brain and step
                     brain.inject_sensory_current(currents)
@@ -247,12 +295,21 @@ def main() -> None:
                     if ev != last_event:
                         event_label = {"baseline": "quiet",
                                        "antenna_irritation": "ANTENNA DUST",
-                                       "sugar_detection": "SUGAR FOUND"}
+                                       "sugar_detection": "SUGAR FOUND",
+                                       "odor_detection": "ODOR PLUME",
+                                       "vibration_threat": "GROUND VIBRATION",
+                                       "shadow_overhead": "SHADOW OVERHEAD",
+                                       "frontal_collision": "FRONTAL COLLISION"}
                         print(f"  [{t:6.1f}s] env: {event_label.get(ev, ev)}")
                         last_event = ev
 
                     if current_behavior != last_behavior:
                         print(f"  [{t:6.1f}s] brain → {current_behavior.value}")
+                        # Trigger start() for programs that need it
+                        if current_behavior == BehaviorState.ESCAPE:
+                            escape_prog.start()
+                        elif current_behavior == BehaviorState.BACKWARD:
+                            backward_prog.start()
                         last_behavior = current_behavior
 
                     # Update brain visualizer
@@ -270,6 +327,18 @@ def main() -> None:
                 elif current_behavior == BehaviorState.FEEDING:
                     angles = feed_prog.step(sim_timestep, speed=0.15, turn=turn)
                     adhesion = feed_prog.get_adhesion_states().astype(float)
+                elif current_behavior == BehaviorState.SEARCHING:
+                    angles = odor_prog.step(sim_timestep, speed=0.6, turn=turn)
+                    adhesion = odor_prog.get_adhesion_states().astype(float)
+                elif current_behavior == BehaviorState.ESCAPE:
+                    angles = escape_prog.step(sim_timestep, speed=1.0, turn=turn)
+                    adhesion = escape_prog.get_adhesion_states().astype(float)
+                elif current_behavior == BehaviorState.FREEZING:
+                    angles = freeze_prog.step(sim_timestep)
+                    adhesion = freeze_prog.get_adhesion_states().astype(float)
+                elif current_behavior == BehaviorState.BACKWARD:
+                    angles = backward_prog.step(sim_timestep, speed=0.5, turn=turn)
+                    adhesion = backward_prog.get_adhesion_states().astype(float)
                 else:
                     angles = walk_cpg.step_per_leg(
                         sim_timestep, leg_speeds=leg_speeds,

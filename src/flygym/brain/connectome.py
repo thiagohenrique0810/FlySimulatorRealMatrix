@@ -77,6 +77,30 @@ OLFACTORY_SEZ_TYPES: list[str] = [
     "peacock",    # 3 neurons – sensory integration
 ]
 
+# Escape / startle response — threat-related SEZ types
+# (predator-like names → fight-or-flight motor relay)
+ESCAPE_SEZ_TYPES: list[str] = [
+    "shark",      # 3 neurons – predator-named
+    "lion",       # 2 neurons – predator-named
+    "horn",       # 3 neurons – defensive structure
+    "snake",      # 2 neurons – threat-named
+    "trident",    # 1 neuron  – weapon-shaped
+]
+
+# Freezing / immobility — anti-predator response SEZ types
+FREEZING_SEZ_TYPES: list[str] = [
+    "mute",       # 1 neuron  – silence/inhibition
+    "phantom",    # 2 neurons – unseen/still
+    "spirit",     # 2 neurons – motionless presence
+]
+
+# Backward walking / retreat — obstacle avoidance SEZ types
+BACKWARD_SEZ_TYPES: list[str] = [
+    "bridle",     # 4 neurons – reining/pulling back
+    "rattle",     # 2 neurons – warning/retreat
+    "roundup",    # 2 neurons – corralling/reverse
+]
+
 # Proxy olfactory receptor neurons — sensory-like neurons
 # (very few inputs, many outputs) that serve as stand-ins for
 # ORNs since the connectome lacks cell-type annotations.

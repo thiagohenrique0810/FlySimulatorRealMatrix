@@ -22,6 +22,7 @@ class NatureWorld(FlatGroundWorld):
         n_grass_patches: Number of grass blade clusters.
         n_food_drops: Number of food droplets on the ground.
         n_odor_sources: Number of odor-emitting flowers.
+        n_obstacles: Number of small obstacles the fly can bump into.
         food_radius: Radius of food droplets (mm).
         tree_distance_range: (min, max) distance from origin for trees (mm).
         seed: Random seed for placement.
@@ -37,6 +38,7 @@ class NatureWorld(FlatGroundWorld):
         n_grass_patches: int = 60,
         n_food_drops: int = 5,
         n_odor_sources: int = 4,
+        n_obstacles: int = 6,
         food_radius: float = 0.8,
         tree_distance_range: tuple[float, float] = (15.0, 80.0),
         seed: int = 42,
@@ -246,6 +248,32 @@ class NatureWorld(FlatGroundWorld):
                 pos=(ox, oy, stem_h + 0.15),
                 size=(petal_r * 0.3,),
                 material="flower_center_mat",
+                contype=0,
+                conaffinity=0,
+            )
+
+        # --- Small obstacles (pebbles / debris) ---
+        root.asset.add(
+            "material", name="pebble_mat",
+            rgba=(0.55, 0.50, 0.42, 1.0),
+            reflectance=0.05,
+        )
+        self.obstacle_positions = []
+        for i in range(n_obstacles):
+            px = rng.uniform(-10, 10)
+            py = rng.uniform(-10, 10)
+            if abs(px) < 2 and abs(py) < 2:
+                px += 3.5
+            self.obstacle_positions.append((px, py))
+            pebble_r = rng.uniform(0.3, 0.7)
+            root.worldbody.add(
+                "geom",
+                name=f"obstacle_{i}",
+                type="ellipsoid",
+                pos=(px, py, pebble_r * 0.4),
+                size=(pebble_r, pebble_r * 0.8, pebble_r * 0.4),
+                euler=(0, 0, rng.uniform(0, math.pi)),
+                material="pebble_mat",
                 contype=0,
                 conaffinity=0,
             )

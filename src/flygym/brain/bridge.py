@@ -194,6 +194,9 @@ class BehaviorState(Enum):
     GROOMING = "grooming"
     FEEDING = "feeding"
     SEARCHING = "searching"
+    ESCAPE = "escape"
+    FREEZING = "freezing"
+    BACKWARD = "backward"
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +418,178 @@ class OdorSearchProgram:
 
 
 # ---------------------------------------------------------------------------
+# Escape / startle programme — fast burst run + random turn
+# ---------------------------------------------------------------------------
+
+
+class EscapeProgram:
+    """Generates a fast escape response.
+
+    The fly accelerates to maximum speed and executes a sharp random turn
+    away from the perceived threat.  The burst decays over ~1 s to a
+    moderately fast run before the controller switches back to walking.
+
+    Args:
+        burst_speed: Peak speed multiplier during the initial startle.
+        turn_magnitude: How sharply the fly turns at escape onset.
+    """
+
+    LEG_NAMES = WalkingPatternGenerator.LEG_NAMES
+    DOF_SPEC = WalkingPatternGenerator.DOF_SPEC
+
+    def __init__(
+        self, burst_speed: float = 2.0, turn_magnitude: float = 0.8
+    ) -> None:
+        self.burst_speed = burst_speed
+        self.turn_magnitude = turn_magnitude
+        self._cpg = WalkingPatternGenerator()
+        self._elapsed: float = 0.0
+        self._escape_turn: float = 0.0
+        self._rng = np.random.default_rng()
+
+    def start(self) -> None:
+        """Call once when escape begins to pick a random dodge direction."""
+        self._elapsed = 0.0
+        self._escape_turn = self._rng.choice([-1.0, 1.0]) * self.turn_magnitude
+
+    def step(
+        self, dt: float, speed: float = 1.0, turn: float = 0.0
+    ) -> np.ndarray:
+        """Advance escape motion.
+
+        Returns:
+            Joint angles ``(6, 7)``.
+        """
+        self._elapsed += dt
+
+        # Burst decays exponentially: fast start, gradual slowdown
+        decay = np.exp(-self._elapsed * 2.0)
+        esc_speed = speed + (self.burst_speed - speed) * decay
+        esc_turn = np.clip(turn + self._escape_turn * decay, -1.0, 1.0)
+
+        angles = self._cpg.step(dt, speed=esc_speed, turn=esc_turn)
+
+        # Legs spread slightly for stability during fast running
+        if decay > 0.3:
+            spread = decay * 0.1
+            for i in range(6):
+                angles[i, 1] += spread * (1 if i < 3 else -1)  # coxa roll outward
+
+        return angles
+
+    def get_adhesion_states(self) -> np.ndarray:
+        return self._cpg.get_adhesion_states()
+
+    def reset(self) -> None:
+        self._cpg.reset()
+        self._elapsed = 0.0
+        self._escape_turn = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Freezing programme — complete immobility
+# ---------------------------------------------------------------------------
+
+
+class FreezingProgram:
+    """Generates freezing (tonic immobility) posture.
+
+    All legs hold a stable stance position derived from the experimental
+    walking data.  No motion occurs.  This is the anti-predator
+    "play dead" response.
+    """
+
+    LEG_NAMES = WalkingPatternGenerator.LEG_NAMES
+    DOF_SPEC = WalkingPatternGenerator.DOF_SPEC
+
+    def __init__(self) -> None:
+        from flygym_demo.spotlight_data import MotionSnippet
+        snippet = MotionSnippet()
+        # Mean of experimental walking = a stable standing posture
+        self._stance_angles: np.ndarray = np.mean(
+            snippet.joint_angles, axis=0
+        )  # (6, 7)
+
+        # Lower the body slightly (crouching freeze)
+        for i in range(6):
+            self._stance_angles[i, 3] += 0.15   # femur pitch: crouch
+            self._stance_angles[i, 5] += 0.10   # tibia pitch: flatten
+
+    def step(self, dt: float, **kwargs) -> np.ndarray:
+        """Return the frozen stance posture (unchanged every step)."""
+        return self._stance_angles.copy()
+
+    def get_adhesion_states(self) -> np.ndarray:
+        """All legs firmly on the ground during freezing."""
+        return np.ones(6, dtype=np.bool_)
+
+    def reset(self) -> None:
+        pass  # No internal state to reset
+
+
+# ---------------------------------------------------------------------------
+# Backward walking programme — reverse and pivot
+# ---------------------------------------------------------------------------
+
+
+class BackwardProgram:
+    """Generates backward walking for obstacle avoidance.
+
+    Plays the walking CPG in reverse (negative speed) with a gradual
+    pivot to one side so the fly retreats and reorients.
+
+    Args:
+        reverse_speed: Backward walking speed multiplier (positive value).
+        pivot_rate: How fast the fly pivots while reversing.
+    """
+
+    LEG_NAMES = WalkingPatternGenerator.LEG_NAMES
+    DOF_SPEC = WalkingPatternGenerator.DOF_SPEC
+
+    def __init__(
+        self, reverse_speed: float = 0.5, pivot_rate: float = 0.4
+    ) -> None:
+        self.reverse_speed = reverse_speed
+        self.pivot_rate = pivot_rate
+        self._cpg = WalkingPatternGenerator()
+        self._elapsed: float = 0.0
+        self._pivot_dir: float = 0.0
+        self._rng = np.random.default_rng()
+
+    def start(self) -> None:
+        """Call once when backward walking begins to pick pivot direction."""
+        self._elapsed = 0.0
+        self._pivot_dir = self._rng.choice([-1.0, 1.0])
+
+    def step(
+        self, dt: float, speed: float = 0.5, turn: float = 0.0
+    ) -> np.ndarray:
+        """Advance backward motion.
+
+        Returns:
+            Joint angles ``(6, 7)``.
+        """
+        self._elapsed += dt
+
+        # Walk backward (negative speed through CPG)
+        rev_speed = -self.reverse_speed
+        # Gradually increase pivot as the fly retreats
+        pivot = self._pivot_dir * self.pivot_rate * min(self._elapsed * 2.0, 1.0)
+        total_turn = np.clip(turn + pivot, -1.0, 1.0)
+
+        angles = self._cpg.step(dt, speed=rev_speed, turn=total_turn)
+        return angles
+
+    def get_adhesion_states(self) -> np.ndarray:
+        return self._cpg.get_adhesion_states()
+
+    def reset(self) -> None:
+        self._cpg.reset()
+        self._elapsed = 0.0
+        self._pivot_dir = 0.0
+
+
+# ---------------------------------------------------------------------------
 # Behaviour controller — brain-driven behaviour switching
 # ---------------------------------------------------------------------------
 
@@ -422,12 +597,15 @@ class OdorSearchProgram:
 class BehaviorController:
     """Selects the active behaviour based on brain neuron group activity.
 
-    Four pools of neurons in the brain are monitored:
+    Seven pools of neurons in the brain are monitored:
 
     * **Walking pool** — high activity → keep walking
     * **Grooming pool** — high activity → antenna grooming
     * **Feeding pool** — high activity → food seeking
     * **Olfactory pool** — high activity → odor search (chemotaxis)
+    * **Escape pool** — high activity → startle escape run
+    * **Freezing pool** — high activity → tonic immobility
+    * **Backward pool** — high activity → reverse and pivot
 
     The pool with the highest normalised firing rate wins.  A minimum
     hold duration prevents rapid flickering between behaviours.
@@ -439,6 +617,9 @@ class BehaviorController:
         grooming_ids: FlyWire IDs for grooming-related neurons.
         feeding_ids: FlyWire IDs for feeding-related neurons.
         olfactory_ids: FlyWire IDs for olfaction-related neurons.
+        escape_ids: FlyWire IDs for escape/startle neurons.
+        freezing_ids: FlyWire IDs for freezing/immobility neurons.
+        backward_ids: FlyWire IDs for backward walking neurons.
         hold_time_s: Minimum time (seconds) to stay in a behaviour.
         grooming_threshold: Minimum rate (Hz) for grooming to activate.
         feeding_threshold: Minimum rate (Hz) for feeding to activate.
@@ -452,6 +633,9 @@ class BehaviorController:
         grooming_ids: list[int],
         feeding_ids: list[int],
         olfactory_ids: list[int] | None = None,
+        escape_ids: list[int] | None = None,
+        freezing_ids: list[int] | None = None,
+        backward_ids: list[int] | None = None,
         *,
         hold_time_s: float = 1.0,
         grooming_threshold: float = 0.8,
@@ -468,6 +652,9 @@ class BehaviorController:
         self._grooming_local = self._resolve_ids(grooming_ids)
         self._feeding_local = self._resolve_ids(feeding_ids)
         self._olfactory_local = self._resolve_ids(olfactory_ids or [])
+        self._escape_local = self._resolve_ids(escape_ids or [])
+        self._freezing_local = self._resolve_ids(freezing_ids or [])
+        self._backward_local = self._resolve_ids(backward_ids or [])
 
         self._state = BehaviorState.WALKING
         self._state_timer: float = 0.0
@@ -536,6 +723,15 @@ class BehaviorController:
         olfactory_excess = max(
             self._pool_rate(motor_rates, self._olfactory_local) - baseline, 0.0
         )
+        escape_excess = max(
+            self._pool_rate(motor_rates, self._escape_local) - baseline, 0.0
+        )
+        freezing_excess = max(
+            self._pool_rate(motor_rates, self._freezing_local) - baseline, 0.0
+        )
+        backward_excess = max(
+            self._pool_rate(motor_rates, self._backward_local) - baseline, 0.0
+        )
 
         # --- Hybrid decision ---
         # Event gates the candidate; brain confirms with excess activity.
@@ -544,7 +740,14 @@ class BehaviorController:
         min_confirm_hz = 1.0
         new_state = self._state
 
-        if event == "antenna_irritation" and groom_excess >= min_confirm_hz:
+        # Escape has highest priority (threat response)
+        if event == "vibration_threat" and escape_excess >= min_confirm_hz:
+            new_state = BehaviorState.ESCAPE
+        elif event == "shadow_overhead" and freezing_excess >= min_confirm_hz:
+            new_state = BehaviorState.FREEZING
+        elif event == "frontal_collision" and backward_excess >= min_confirm_hz:
+            new_state = BehaviorState.BACKWARD
+        elif event == "antenna_irritation" and groom_excess >= min_confirm_hz:
             new_state = BehaviorState.GROOMING
         elif event == "sugar_detection" and feed_excess >= min_confirm_hz:
             new_state = BehaviorState.FEEDING
@@ -597,6 +800,12 @@ class SensoryEventGenerator:
           neurons → drives feeding neuron pools
         * **odor_detection** — moderate excitation of olfactory proxy
           neurons → drives chemotaxis search behaviour
+        * **vibration_threat** — sharp burst on mechano-sensory neurons
+          → drives escape/startle response
+        * **shadow_overhead** — broad inhibitory-like stimulus
+          → drives freezing (tonic immobility)
+        * **frontal_collision** — front-leg mechanosensors spike
+          → drives backward walking / retreat
         * **baseline** — moderate tonic excitation → walking
 
     Args:
@@ -606,6 +815,9 @@ class SensoryEventGenerator:
         irritation_strength_mv: Extra current for antenna irritation (mV).
         sugar_strength_mv: Extra current for sugar detection (mV).
         odor_strength_mv: Extra current for odor detection (mV).
+        threat_strength_mv: Extra current for vibration threat (mV).
+        shadow_strength_mv: Extra current for shadow overhead (mV).
+        collision_strength_mv: Extra current for frontal collision (mV).
         seed: Random seed for reproducibility.
     """
 
@@ -618,6 +830,9 @@ class SensoryEventGenerator:
         irritation_strength_mv: float = 25.0,
         sugar_strength_mv: float = 20.0,
         odor_strength_mv: float = 22.0,
+        threat_strength_mv: float = 30.0,
+        shadow_strength_mv: float = 18.0,
+        collision_strength_mv: float = 26.0,
         seed: int | None = None,
     ) -> None:
         self.n_sensory = n_sensory
@@ -626,6 +841,9 @@ class SensoryEventGenerator:
         self.irritation_strength_mv = irritation_strength_mv
         self.sugar_strength_mv = sugar_strength_mv
         self.odor_strength_mv = odor_strength_mv
+        self.threat_strength_mv = threat_strength_mv
+        self.shadow_strength_mv = shadow_strength_mv
+        self.collision_strength_mv = collision_strength_mv
         self._rng = np.random.default_rng(seed)
 
         self._current_event: str = "baseline"
@@ -654,14 +872,20 @@ class SensoryEventGenerator:
         # Check if it's time for a new event
         if self._current_event == "baseline":
             if self._event_timer >= self._next_event_at:
-                # Pick random event type
+                # Pick random event type (7 behaviours)
                 r = self._rng.random()
-                if r < 0.35:
+                if r < 0.20:
                     self._current_event = "antenna_irritation"
-                elif r < 0.65:
+                elif r < 0.35:
                     self._current_event = "sugar_detection"
-                elif r < 0.90:
+                elif r < 0.50:
                     self._current_event = "odor_detection"
+                elif r < 0.65:
+                    self._current_event = "vibration_threat"
+                elif r < 0.77:
+                    self._current_event = "shadow_overhead"
+                elif r < 0.89:
+                    self._current_event = "frontal_collision"
                 else:
                     self._current_event = "baseline"  # false alarm
                 self._event_timer = 0.0
@@ -681,13 +905,30 @@ class SensoryEventGenerator:
             extra[start:start + group] = self.sugar_strength_mv * ramp
         elif self._current_event == "odor_detection":
             # Stimulate olfactory group (last half of sensory neurons)
-            # Olfactory has more neurons → stimulate broader group
             group = max(self.n_sensory // 2, 1)
-            # Odor: slower ramp (diffusion-like), with fluctuations
             ramp = min(self._event_timer / 0.5, 1.0)
-            # Add concentration fluctuations (turbulent plume)
             fluct = 0.7 + 0.3 * np.sin(self._event_timer * 8.0)
             extra[-group:] = self.odor_strength_mv * ramp * fluct
+        elif self._current_event == "vibration_threat":
+            # Sharp burst across all sensory neurons (ground vibration)
+            # Very fast onset, then sustained at lower level
+            burst = np.exp(-self._event_timer * 5.0)  # fast decay
+            sustained = 0.4
+            strength = max(burst, sustained)
+            extra[:] = self.threat_strength_mv * strength
+        elif self._current_event == "shadow_overhead":
+            # Broad, diffuse stimulus across visual-like neurons
+            # (middle third of sensory array)
+            group = max(self.n_sensory // 3, 1)
+            start = max(self.n_sensory // 3, 1)
+            ramp = min(self._event_timer / 0.2, 1.0)
+            extra[start:start + group] = self.shadow_strength_mv * ramp
+        elif self._current_event == "frontal_collision":
+            # Front mechano-sensors spike (first sixth = front legs)
+            group = max(self.n_sensory // 6, 1)
+            # Sharp onset like hitting a wall
+            ramp = min(self._event_timer / 0.1, 1.0)
+            extra[:group] = self.collision_strength_mv * ramp
 
         return extra
 
