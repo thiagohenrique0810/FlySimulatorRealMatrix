@@ -135,6 +135,19 @@ cd ~/Desktop/www/flygym
 uv run python scripts/launch_interactive_viewer.py
 ```
 
+#### Mosca controlada pelo cérebro (conectoma) — FlyGym v2 + Brain
+
+Simulação com loop sensorimotor fechado: o modelo neural LIF (baseado no conectoma FlyWire v783) recebe entradas sensoriais do corpo simulado e gera comandos motores que controlam a locomoção via CPG. Usa uma subrede do cérebro inteiro centrada em neurônios motores do SEZ.
+
+```bash
+cd ~/Desktop/www/flygym
+source .venv/bin/activate
+python run_brain_driven.py
+# Saída: fly_brain_driven.mp4
+```
+
+**Requer:** dados do conectoma em `external/Drosophila_brain_model/` (ver seção abaixo).
+
 #### Mosca buscando comida com olfato (vídeo) — FlyGym v1
 
 A mosca usa sensores de odor nas antenas para navegar autonomamente até uma fonte de comida (laranja), desviando de fontes aversivas (azul). Usa controlador híbrido CPG + regras reflexivas.
@@ -224,12 +237,47 @@ cd ~/Desktop/www/flygym-v1
 | Performance GPU | ~300x (Warp/MJWarp) | Não disponível |
 | Visão (olhos compostos) | Não disponível | Simulada com ommatidia |
 | Olfato (antenas) | Não disponível | Sensores de odor |
-| CPG (padrão de caminhada) | Não disponível | Osciladores acoplados |
+| Cérebro (conectoma LIF) | `flygym.brain` (integrado) | Não disponível |
+| CPG (padrão de caminhada) | Via `brain.bridge` | Osciladores acoplados |
 | Controlador reflexivo | Não disponível | Regras de correção |
 | Reinforcement Learning | Não disponível | Interface Gymnasium |
 | Múltiplas moscas | Suportado | Suportado |
 | Adesão de pernas | Suportado | Suportado |
 | Viewer interativo | MuJoCo nativo | MuJoCo nativo |
+
+---
+
+### Módulo `flygym.brain` — Integração do Modelo Cerebral
+
+O módulo `flygym.brain` foi desenvolvido neste projeto para integrar o modelo neural do cérebro inteiro da *Drosophila* (Shiu et al., 2023) com a simulação biomecânica do FlyGym v2. A arquitetura possui três componentes:
+
+| Componente | Módulo | Descrição |
+|---|---|---|
+| **Conectoma** | `flygym.brain.connectome` | Carrega os dados do FlyWire v783 (neurônios, sinapses, tipos SEZ) |
+| **Modelo LIF** | `flygym.brain.lif_model` | Rede de neurônios LIF online com janela de spikes e subredes |
+| **Ponte Sensoriomotora** | `flygym.brain.bridge` | Converte firing rates em comandos de velocidade/curva + CPG |
+
+#### Dados do Conectoma
+
+O modelo neural depende dos dados do repositório [philshiu/Drosophila_brain_model](https://github.com/philshiu/Drosophila_brain_model):
+
+```bash
+git clone https://github.com/philshiu/Drosophila_brain_model.git external/Drosophila_brain_model
+```
+
+Os arquivos essenciais são:
+- `Completeness_783.csv` — tabela de neurônios (IDs, tipos, completude)
+- `Connectivity_783.parquet` — matriz de conectividade sináptica (v783 pública)
+
+#### Loop Sensorimotor
+
+O loop fechado funciona assim a cada ciclo:
+
+1. **Sense** — lê contatos de pernas, ângulos articulares e posição do corpo da simulação física
+2. **Brain step** — injeta correntes sensoriais no modelo LIF, avança a rede, lê taxas de disparo dos neurônios motores
+3. **Act** — converte firing rates em velocidade/curva, gera alvos articulares via CPG, envia ao simulador
+
+---
 
 ### Notas para macOS
 
