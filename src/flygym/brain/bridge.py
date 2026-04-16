@@ -2,10 +2,12 @@
 
 Converts FlyGym sensor readings into neural currents for the brain model,
 and converts motor neuron firing rates into joint-angle targets for the body.
+Supports three behaviours: walking, antenna grooming, and food seeking.
 """
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Sequence
 
 import numpy as np
@@ -15,66 +17,71 @@ from flygym.brain.lif_model import OnlineBrainModel
 
 
 # ---------------------------------------------------------------------------
-# Walking-pattern generator (CPG-like, parametric)
+# Walking-pattern generator — data-driven (replays experimental recording)
 # ---------------------------------------------------------------------------
 
 
 class WalkingPatternGenerator:
-    """A simple CPG-like generator that produces tripod-gait joint angles.
+    """Data-driven walking pattern generator.
 
-    The pattern is parameterized by walking speed (frequency) and turning
-    (left/right amplitude modulation).  Joint angle trajectories are based
-    on sinusoidal approximations of the experimental walking data with
-    biologically plausible ranges for *Drosophila melanogaster*.
+    Instead of synthesising joint angles from sinusoids, this generator
+    replays the experimentally recorded *Drosophila* walking snippet
+    shipped with ``flygym_demo``.  The phase pointer advances at a rate
+    proportional to the ``speed`` parameter, and turning is achieved by
+    modulating the playback speed of left vs right legs.
 
-    The six legs follow a **tripod gait** with two anti-phase groups:
-    - Group A (phase = 0):  lf, rm, lh
-    - Group B (phase = π):  rf, lm, rh
-
-    For each leg, seven DOFs are produced:
-    ``(coxa_pitch, coxa_roll, coxa_yaw, femur_pitch, femur_roll,
-    tibia_pitch, tarsus1_pitch)``
+    This guarantees that the inter-DOF coordination, amplitude ranges and
+    stance/swing timing are always biologically realistic.
 
     Args:
-        base_frequency: Stepping frequency in Hz at ``speed=1.0``.
-        n_dofs_per_leg: Number of degrees of freedom per leg (default 7).
+        base_frequency: Nominal stepping frequency (Hz) at speed = 1.0.
+            The experimental data contains ~12 Hz stepping.
     """
 
-    # Leg names in the canonical order used by FlyGym v2
     LEG_NAMES = ["lf", "lm", "lh", "rf", "rm", "rh"]
 
-    # Tripod gait phase offsets (radians)
-    TRIPOD_PHASES = {
-        "lf": 0.0,
-        "rm": 0.0,
-        "lh": 0.0,
-        "rf": np.pi,
-        "lm": np.pi,
-        "rh": np.pi,
-    }
+    # Tripod groups for adhesion: group A swings while group B is in stance
+    _TRIPOD_A = {0, 4, 2}   # lf, rm, lh  (indices)
+    _TRIPOD_B = {3, 1, 5}   # rf, lm, rh
 
-    # Neutral (resting) joint angles per DOF (radians), shared for all legs.
-    # Derived from experimental walking data (MotionSnippet mean values).
-    # Order: coxa_yaw, coxa_pitch, coxa_roll, femur_pitch, femur_roll,
-    #        tibia_pitch, tarsus1_pitch
-    NEUTRAL_ANGLES = np.array([0.175, 1.663, -0.041, -2.051, 0.114, 1.643, -0.405])
-
-    # Oscillation amplitudes per DOF (radians) during walking.
-    # Derived from experimental walking data (half peak-to-peak ranges).
-    WALK_AMPLITUDES = np.array([0.29, 0.50, 0.31, 0.67, 0.65, 0.93, 0.62])
-
-    def __init__(
-        self,
-        base_frequency: float = 12.0,
-        n_dofs_per_leg: int = 7,
-    ) -> None:
+    def __init__(self, base_frequency: float = 12.0) -> None:
         self.base_frequency = base_frequency
-        self.n_dofs_per_leg = n_dofs_per_leg
 
-        # Internal phase accumulators (one per leg)
-        self._phases: dict[str, float] = {
-            leg: self.TRIPOD_PHASES[leg] for leg in self.LEG_NAMES
-        }
+        # Load the experimental walking data
+        from flygym_demo.spotlight_data import MotionSnippet
+        snippet = MotionSnippet()
+        # shape (n_frames, 6, 7), legs order matches LEG_NAMES,
+        # DOFs per leg: (coxa_pitch, coxa_roll, coxa_yaw,
+        #                trochanterfemur_pitch, trochanterfemur_roll,
+        #                tibia_pitch, tarsus1_pitch)
+        self._ref_angles: np.ndarray = snippet.joint_angles.copy()
+        self._ref_fps: float = float(snippet.data_fps)
+        self._n_frames: int = self._ref_angles.shape[0]
+
+        # Per-leg, per-DOF min/max from experimental data (for clamping)
+        self._ref_min: np.ndarray = np.min(self._ref_angles, axis=0)  # (6, 7)
+        self._ref_max: np.ndarray = np.max(self._ref_angles, axis=0)  # (6, 7)
+        # Add a small margin so brain offsets have some room
+        margin = 0.05  # ~3 degrees
+        self._ref_min -= margin
+        self._ref_max += margin
+
+        # Phase pointer (fractional frame index, wraps around)
+        self._phase: float = 0.0
+
+        # Per-leg phase offsets for turning (left legs vs right legs)
+        self._leg_phases: np.ndarray = np.zeros(6)
+
+    # DOF ordering in the reference data (matches MotionSnippet.dofs_per_leg)
+    DOF_SPEC = [
+        ("thorax", "coxa", "pitch"),
+        ("thorax", "coxa", "roll"),
+        ("thorax", "coxa", "yaw"),
+        ("coxa", "trochanterfemur", "pitch"),
+        ("coxa", "trochanterfemur", "roll"),
+        ("trochanterfemur", "tibia", "pitch"),
+        ("tibia", "tarsus1", "pitch"),
+    ]
 
     def step(
         self,
@@ -82,69 +89,516 @@ class WalkingPatternGenerator:
         speed: float = 1.0,
         turn: float = 0.0,
     ) -> np.ndarray:
-        """Advance the CPG by *dt* seconds and return joint angle targets.
+        """Advance the pattern by *dt* seconds and return joint angles.
 
         Args:
-            dt: Time step in seconds.
-            speed: Walking speed multiplier (0 = standing, 1 = normal, >1 = fast).
-            turn: Turning signal in [-1, 1].
-                  Positive = turn right (left legs faster),
-                  Negative = turn left (right legs faster).
+            dt: Physics timestep in seconds.
+            speed: Walking speed multiplier (0 = stationary, 1 = normal).
+            turn: Turning signal in [-1, 1]. Positive = turn right.
 
         Returns:
-            Joint angle targets of shape ``(6, 7)`` in radians, with legs
-            ordered as ``["lf", "lm", "lh", "rf", "rm", "rh"]``.
+            Joint angles of shape ``(6, 7)`` in the same DOF order as the
+            experimental data.
         """
-        angles = np.zeros((6, self.n_dofs_per_leg))
+        leg_speeds = np.full(6, speed)
+        return self.step_per_leg(dt, leg_speeds=leg_speeds, turn=turn)
 
+    def step_per_leg(
+        self,
+        dt: float,
+        leg_speeds: np.ndarray,
+        turn: float = 0.0,
+        joint_offsets: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Advance with per-leg speed control and optional joint offsets.
+
+        This is the brain-enhanced version: instead of one global speed,
+        each leg has its own stepping speed driven by its motor neuron pool.
+
+        Args:
+            dt: Physics timestep in seconds.
+            leg_speeds: Shape ``(6,)`` — speed multiplier for each leg.
+            turn: Turning signal in [-1, 1]. Positive = turn right.
+            joint_offsets: Optional shape ``(6, 7)`` — angle offsets added
+                to the replayed experimental data (brain-modulated posture).
+
+        Returns:
+            Joint angles of shape ``(6, 7)``.
+        """
+        frames_per_sec = self._ref_fps  # 330 fps in the recording
+
+        # Advance per-leg phases with individual speeds and turning
         for i, leg in enumerate(self.LEG_NAMES):
-            # Determine frequency modulation for turning
-            side = leg[0]  # 'l' or 'r'
+            side = leg[0]
             if side == "l":
-                freq_mod = 1.0 + turn * 0.3
-                amp_mod = 1.0 + turn * 0.2
+                turn_mod = 1.0 + turn * 0.3
             else:
-                freq_mod = 1.0 - turn * 0.3
-                amp_mod = 1.0 - turn * 0.2
+                turn_mod = 1.0 - turn * 0.3
+            self._leg_phases[i] += frames_per_sec * leg_speeds[i] * turn_mod * dt
 
-            freq = self.base_frequency * speed * freq_mod
-            amp_scale = speed * max(amp_mod, 0.1)
+        # Also advance the global phase (used for adhesion)
+        self._phase += frames_per_sec * float(np.mean(leg_speeds)) * dt
 
-            # Advance phase
-            self._phases[leg] += 2.0 * np.pi * freq * dt
-            phase = self._phases[leg]
+        # Sample angles for each leg from the reference data via interpolation
+        angles = np.zeros((6, 7))
+        for i in range(6):
+            ph = self._leg_phases[i] % self._n_frames
+            f0 = int(ph) % self._n_frames
+            f1 = (f0 + 1) % self._n_frames
+            frac = ph - int(ph)
+            angles[i] = (1.0 - frac) * self._ref_angles[f0, i] + frac * self._ref_angles[f1, i]
 
-            # Generate joint angles: neutral + amplitude * sin(phase + dof_offset)
-            for d in range(self.n_dofs_per_leg):
-                dof_phase_offset = d * 0.15  # slight phase offset between DOFs
-                oscillation = (
-                    self.WALK_AMPLITUDES[d]
-                    * amp_scale
-                    * np.sin(phase + dof_phase_offset)
-                )
-                angles[i, d] = self.NEUTRAL_ANGLES[d] + oscillation
+        # Apply brain-driven joint offsets
+        if joint_offsets is not None:
+            angles += joint_offsets
+
+        # Clamp to the range seen in the experimental data so legs
+        # never go into unnatural poses
+        angles = np.clip(angles, self._ref_min, self._ref_max)
 
         return angles
 
     def get_adhesion_states(self) -> np.ndarray:
-        """Compute leg adhesion states based on current gait phase.
+        """Return per-leg adhesion states based on the reference data.
 
-        Returns:
-            Boolean array of shape ``(6,)``:  True = stance (adhesion on),
-            False = swing (adhesion off).
+        Uses the tibia pitch (DOF 5) to detect stance vs swing:
+        when tibia is extended (high pitch = leg down) → stance.
         """
         states = np.ones(6, dtype=np.bool_)
-        for i, leg in enumerate(self.LEG_NAMES):
-            # Stance when sin(phase) >= 0 (half of the cycle)
-            phase_mod = self._phases[leg] % (2.0 * np.pi)
-            states[i] = phase_mod < np.pi
+        for i in range(6):
+            ph = self._leg_phases[i] % self._n_frames
+            f0 = int(ph) % self._n_frames
+            f1 = (f0 + 1) % self._n_frames
+            frac = ph - int(ph)
+            tibia_pitch = ((1.0 - frac) * self._ref_angles[f0, i, 5]
+                           + frac * self._ref_angles[f1, i, 5])
+            # Stance when tibia is more extended (above median)
+            median_tp = np.median(self._ref_angles[:, i, 5])
+            states[i] = tibia_pitch >= median_tp
         return states
 
     def reset(self) -> None:
-        """Reset all phases to initial tripod configuration."""
-        self._phases = {
-            leg: self.TRIPOD_PHASES[leg] for leg in self.LEG_NAMES
-        }
+        """Reset phase to the beginning of the recording."""
+        self._phase = 0.0
+        self._leg_phases = np.zeros(6)
+
+
+# ---------------------------------------------------------------------------
+# Behaviour state machine
+# ---------------------------------------------------------------------------
+
+
+class BehaviorState(Enum):
+    """Active behaviour of the fly."""
+    WALKING = "walking"
+    GROOMING = "grooming"
+    FEEDING = "feeding"
+
+
+# ---------------------------------------------------------------------------
+# Antenna-grooming motor programme
+# ---------------------------------------------------------------------------
+
+
+class GroomingProgram:
+    """Generates front-leg grooming trajectories.
+
+    During grooming the front legs (LF, RF) lift toward the head and
+    oscillate in a scraping motion while the four remaining legs hold a
+    stable stance position derived from the experimental walking data.
+
+    Args:
+        grooming_freq: Scraping frequency in Hz (typically ~3 Hz).
+    """
+
+    LEG_NAMES = WalkingPatternGenerator.LEG_NAMES
+    DOF_SPEC = WalkingPatternGenerator.DOF_SPEC
+
+    def __init__(self, grooming_freq: float = 3.0) -> None:
+        self.grooming_freq = grooming_freq
+        self._phase: float = 0.0
+
+        # Load walking data to get stance angles for mid/hind legs
+        from flygym_demo.spotlight_data import MotionSnippet
+        snippet = MotionSnippet()
+        ref = snippet.joint_angles  # (660, 6, 7)
+
+        # Stance = mean angles (stable standing approximation)
+        self._stance_angles: np.ndarray = np.mean(ref, axis=0)  # (6, 7)
+
+        # ----- Front-leg grooming key-poses (lf) -----
+        # Two poses that the front legs oscillate between:
+        # "reach" = legs stretched forward & up toward antenna
+        # "scrape" = legs pulled slightly back & down
+        lf_mean = self._stance_angles[0]  # reference
+
+        # Reach pose: coxa forward, femur extended, tibia curled up
+        self._reach_lf = lf_mean.copy()
+        self._reach_lf[0] = 0.75   # coxa_pitch: swing forward
+        self._reach_lf[1] = 0.45   # coxa_roll: bring inward
+        self._reach_lf[3] = -1.3   # femur_pitch: extend up
+        self._reach_lf[5] = 0.7    # tibia_pitch: flex toward head
+        self._reach_lf[6] = -0.9   # tarsus: curl to touch antenna
+
+        # Scrape pose: slight retraction (rubbing motion)
+        self._scrape_lf = lf_mean.copy()
+        self._scrape_lf[0] = 0.55  # coxa_pitch: pull back a bit
+        self._scrape_lf[1] = 0.50  # coxa_roll: still inward
+        self._scrape_lf[3] = -1.5  # femur_pitch: slightly lower
+        self._scrape_lf[5] = 1.0   # tibia_pitch: slightly extended
+        self._scrape_lf[6] = -0.7  # tarsus: partial release
+
+        # Mirror for rf (roll and yaw signs flip)
+        self._reach_rf = self._reach_lf.copy()
+        self._reach_rf[1] = self._stance_angles[3, 1] - (self._stance_angles[0, 1] - self._reach_lf[1])
+        self._reach_rf[2] = -self._reach_lf[2] if abs(self._reach_lf[2]) > 0.01 else self._reach_lf[2]
+
+        self._scrape_rf = self._scrape_lf.copy()
+        self._scrape_rf[1] = self._stance_angles[3, 1] - (self._stance_angles[0, 1] - self._scrape_lf[1])
+        self._scrape_rf[2] = -self._scrape_lf[2] if abs(self._scrape_lf[2]) > 0.01 else self._scrape_lf[2]
+
+    def step(self, dt: float) -> np.ndarray:
+        """Advance grooming motion by *dt* seconds.
+
+        Returns:
+            Joint angles ``(6, 7)`` — same shape as
+            :class:`WalkingPatternGenerator`.
+        """
+        self._phase += dt * self.grooming_freq * 2.0 * np.pi
+
+        # Smooth oscillation factor 0→1→0
+        t = 0.5 * (1.0 + np.sin(self._phase))
+
+        angles = self._stance_angles.copy()
+        # Front legs: interpolate between reach and scrape
+        angles[0] = (1.0 - t) * self._scrape_lf + t * self._reach_lf
+        angles[3] = (1.0 - t) * self._scrape_rf + t * self._reach_rf
+
+        return angles
+
+    def get_adhesion_states(self) -> np.ndarray:
+        """During grooming, front legs are OFF ground, rest are ON."""
+        return np.array([False, True, True, False, True, True])
+
+    def reset(self) -> None:
+        self._phase = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Food-seeking / feeding motor programme
+# ---------------------------------------------------------------------------
+
+
+class FeedingProgram:
+    """Generates food-seeking and proboscis extension behaviour.
+
+    The fly slows down and makes exploratory turns.  Periodically the
+    front legs lift slightly (chemosensory tapping) and the walking
+    pattern alternates between slow forward motion and pausing.
+
+    Args:
+        tap_freq: Front-leg tapping frequency (Hz).
+    """
+
+    LEG_NAMES = WalkingPatternGenerator.LEG_NAMES
+    DOF_SPEC = WalkingPatternGenerator.DOF_SPEC
+
+    def __init__(self, tap_freq: float = 2.0) -> None:
+        self.tap_freq = tap_freq
+        self._cpg = WalkingPatternGenerator()
+        self._tap_phase: float = 0.0
+
+    def step(
+        self, dt: float, speed: float = 0.15, turn: float = 0.0
+    ) -> np.ndarray:
+        """Advance feeding motion.
+
+        Returns:
+            Joint angles ``(6, 7)``.
+        """
+        self._tap_phase += dt * self.tap_freq * 2.0 * np.pi
+        tap = 0.5 * (1.0 + np.sin(self._tap_phase))
+
+        # Slow walking with exploration turns
+        explore_turn = turn + 0.3 * np.sin(self._tap_phase * 0.37)
+        angles = self._cpg.step(dt, speed=speed, turn=np.clip(explore_turn, -1, 1))
+
+        # Front-leg tapping: periodically lift front legs slightly
+        if tap > 0.7:
+            lift = (tap - 0.7) / 0.3  # 0→1 during top 30%
+            for i in [0, 3]:  # lf, rf
+                angles[i, 0] += 0.2 * lift   # coxa pitch forward
+                angles[i, 3] += 0.3 * lift   # femur pitch up
+                angles[i, 5] -= 0.3 * lift   # tibia flex
+                angles[i, 6] -= 0.2 * lift   # tarsus tap
+
+        return angles
+
+    def get_adhesion_states(self) -> np.ndarray:
+        """During feeding, use the walking CPG's adhesion with front legs
+        sometimes OFF during tapping."""
+        states = self._cpg.get_adhesion_states()
+        tap = 0.5 * (1.0 + np.sin(self._tap_phase))
+        if tap > 0.7:
+            states[0] = False  # lf
+            states[3] = False  # rf
+        return states
+
+    def reset(self) -> None:
+        self._cpg.reset()
+        self._tap_phase = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Behaviour controller — brain-driven behaviour switching
+# ---------------------------------------------------------------------------
+
+
+class BehaviorController:
+    """Selects the active behaviour based on brain neuron group activity.
+
+    Three pools of neurons in the brain are monitored:
+
+    * **Walking pool** — high activity → keep walking
+    * **Grooming pool** — high activity → antenna grooming
+    * **Feeding pool** — high activity → food seeking
+
+    The pool with the highest normalised firing rate wins.  A minimum
+    hold duration prevents rapid flickering between behaviours.
+
+    Args:
+        brain: The :class:`OnlineBrainModel`.
+        connectome: The :class:`Connectome`.
+        walking_ids: FlyWire IDs for walking-related neurons.
+        grooming_ids: FlyWire IDs for grooming-related neurons.
+        feeding_ids: FlyWire IDs for feeding-related neurons.
+        hold_time_s: Minimum time (seconds) to stay in a behaviour.
+        grooming_threshold: Minimum rate (Hz) for grooming to activate.
+        feeding_threshold: Minimum rate (Hz) for feeding to activate.
+    """
+
+    def __init__(
+        self,
+        brain: "OnlineBrainModel",
+        connectome: "Connectome",
+        walking_ids: list[int],
+        grooming_ids: list[int],
+        feeding_ids: list[int],
+        *,
+        hold_time_s: float = 1.0,
+        grooming_threshold: float = 0.8,
+        feeding_threshold: float = 0.6,
+    ) -> None:
+        self.brain = brain
+        self.connectome = connectome
+        self.hold_time_s = hold_time_s
+        self.grooming_threshold = grooming_threshold
+        self.feeding_threshold = feeding_threshold
+
+        # Map FlyWire IDs → local indices in the brain model
+        self._walking_local = self._resolve_ids(walking_ids)
+        self._grooming_local = self._resolve_ids(grooming_ids)
+        self._feeding_local = self._resolve_ids(feeding_ids)
+
+        self._state = BehaviorState.WALKING
+        self._state_timer: float = 0.0
+
+    def _resolve_ids(self, fly_ids: list[int]) -> list[int]:
+        """Convert FlyWire IDs to indices in the motor_rates array.
+
+        The motor_rates array from ``brain.get_motor_spike_rates()`` has
+        one entry per motor neuron, in the same order they were passed to
+        ``OnlineBrainModel(motor_neuron_ids=...)``.  We find which slots
+        in that array correspond to the given FlyWire IDs.
+        """
+        # _motor_global holds the *global connectome indices* of the motor
+        # neurons, in the order they appear in the spike-rate output.
+        motor_global = self.brain._motor_global
+        # Build flyid → motor-array-slot mapping
+        try:
+            slot_map = {
+                self.connectome.index_to_id(gi): slot
+                for slot, gi in enumerate(motor_global)
+            }
+        except Exception:
+            return []
+
+        return [slot_map[fid] for fid in fly_ids if fid in slot_map]
+
+    @property
+    def state(self) -> BehaviorState:
+        return self._state
+
+    def update(self, dt: float) -> BehaviorState:
+        """Evaluate brain activity and return the active behaviour.
+
+        Args:
+            dt: Elapsed time since last call (seconds).
+        """
+        self._state_timer += dt
+
+        # Check hold time
+        if self._state_timer < self.hold_time_s:
+            return self._state
+
+        motor_rates = self.brain.get_motor_spike_rates()
+        if len(motor_rates) == 0:
+            return self._state
+
+        walk_rate = self._pool_rate(motor_rates, self._walking_local)
+        groom_rate = self._pool_rate(motor_rates, self._grooming_local)
+        feed_rate = self._pool_rate(motor_rates, self._feeding_local)
+
+        # Normalise by pool size — smaller pools (grooming=10, feeding=5)
+        # would always lose to walking (99) in absolute rate.
+        # Scale so all pools compete fairly.
+        n_walk = max(len(self._walking_local), 1)
+        n_groom = max(len(self._grooming_local), 1)
+        n_feed = max(len(self._feeding_local), 1)
+        ref_size = (n_walk + n_groom + n_feed) / 3.0
+        walk_score = walk_rate * (ref_size / n_walk)
+        groom_score = groom_rate * (ref_size / n_groom)
+        feed_score = feed_rate * (ref_size / n_feed)
+
+        new_state = self._state
+
+        # Priority: grooming > feeding > walking
+        if groom_score >= self.grooming_threshold and groom_score > walk_score * 0.5:
+            new_state = BehaviorState.GROOMING
+        elif feed_score >= self.feeding_threshold and feed_score > walk_score * 0.3:
+            new_state = BehaviorState.FEEDING
+        else:
+            new_state = BehaviorState.WALKING
+
+        if new_state != self._state:
+            self._state = new_state
+            self._state_timer = 0.0
+
+        return self._state
+
+    @staticmethod
+    def _pool_rate(rates: np.ndarray, indices: list[int]) -> float:
+        if not indices:
+            return 0.0
+        valid = [i for i in indices if i < len(rates)]
+        if not valid:
+            return 0.0
+        return float(np.mean(rates[valid]))
+
+    def reset(self) -> None:
+        self._state = BehaviorState.WALKING
+        self._state_timer = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Sensory event generator — simulated environmental stimuli
+# ---------------------------------------------------------------------------
+
+
+class SensoryEventGenerator:
+    """Generates random environmental events that stimulate the brain.
+
+    The real fly lives in a world with unpredictable stimuli: dust on the
+    antennae triggers grooming, encountering a sugar patch triggers feeding,
+    and quiescent periods allow walking.  This class simulates those events
+    by injecting differential currents into specific sensory neuron groups,
+    causing the brain to switch behaviours *from its own neural dynamics*
+    rather than a fixed schedule.
+
+    Events:
+        * **antenna_irritation** — strong excitation of mechano-sensory
+          neurons → drives grooming neuron pools
+        * **sugar_detection** — strong excitation of gustatory/sugar-sensing
+          neurons → drives feeding neuron pools
+        * **baseline** — moderate tonic excitation → walking
+
+    Args:
+        n_sensory: Total number of sensory neurons.
+        event_interval_s: Mean time between events (Poisson process).
+        event_duration_s: How long each event persists.
+        irritation_strength_mv: Extra current for antenna irritation (mV).
+        sugar_strength_mv: Extra current for sugar detection (mV).
+        seed: Random seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        n_sensory: int,
+        *,
+        event_interval_s: float = 4.0,
+        event_duration_s: float = 2.0,
+        irritation_strength_mv: float = 25.0,
+        sugar_strength_mv: float = 20.0,
+        seed: int | None = None,
+    ) -> None:
+        self.n_sensory = n_sensory
+        self.event_interval_s = event_interval_s
+        self.event_duration_s = event_duration_s
+        self.irritation_strength_mv = irritation_strength_mv
+        self.sugar_strength_mv = sugar_strength_mv
+        self._rng = np.random.default_rng(seed)
+
+        self._current_event: str = "baseline"
+        self._event_timer: float = 0.0
+        self._next_event_at: float = self._sample_next_time()
+
+    def _sample_next_time(self) -> float:
+        return self._rng.exponential(self.event_interval_s)
+
+    def step(self, dt: float) -> np.ndarray:
+        """Advance and return extra sensory currents (mV).
+
+        Returns:
+            Shape ``(n_sensory,)`` — extra current on top of baseline.
+        """
+        extra = np.zeros(self.n_sensory)
+        self._event_timer += dt
+
+        # Check if current event has ended
+        if self._current_event != "baseline":
+            if self._event_timer >= self.event_duration_s:
+                self._current_event = "baseline"
+                self._event_timer = 0.0
+                self._next_event_at = self._sample_next_time()
+
+        # Check if it's time for a new event
+        if self._current_event == "baseline":
+            if self._event_timer >= self._next_event_at:
+                # Pick random event type
+                r = self._rng.random()
+                if r < 0.45:
+                    self._current_event = "antenna_irritation"
+                elif r < 0.9:
+                    self._current_event = "sugar_detection"
+                else:
+                    self._current_event = "baseline"  # false alarm
+                self._event_timer = 0.0
+
+        # Build stimulus based on current event
+        if self._current_event == "antenna_irritation":
+            # Stimulate mechano-sensory group (first third of sensory neurons)
+            group = max(self.n_sensory // 3, 1)
+            # Ramp up then plateau
+            ramp = min(self._event_timer / 0.3, 1.0)
+            extra[:group] = self.irritation_strength_mv * ramp
+        elif self._current_event == "sugar_detection":
+            # Stimulate gustatory group (last third of sensory neurons)
+            group = max(self.n_sensory // 3, 1)
+            ramp = min(self._event_timer / 0.3, 1.0)
+            extra[-group:] = self.sugar_strength_mv * ramp
+
+        return extra
+
+    @property
+    def current_event(self) -> str:
+        return self._current_event
+
+    def reset(self, seed: int | None = None) -> None:
+        self._current_event = "baseline"
+        self._event_timer = 0.0
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        self._next_event_at = self._sample_next_time()
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +741,76 @@ class SensorimotorBridge:
 
         return (speed, turn)
 
+    def motor_rates_to_leg_commands(
+        self,
+        motor_rates: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Convert motor rates to per-leg speeds and joint-level modulation.
+
+        Instead of collapsing 114 motor neurons into 2 numbers (speed, turn),
+        this maps them to 6 individual leg speeds and per-joint posture
+        offsets — giving the brain fine-grained motor control.
+
+        Motor neurons are split into 6 groups (LF, LM, LH, RF, RM, RH).
+        Each group's mean firing rate drives its leg's stepping speed.
+        The variance within each group creates subtle joint angle offsets
+        (the brain modulating posture, not just speed).
+
+        Args:
+            motor_rates: Shape ``(n_motor,)`` — firing rates in Hz.
+
+        Returns:
+            leg_speeds: Shape ``(6,)`` — per-leg speed multipliers.
+            joint_offsets: Shape ``(6, 7)`` — angle offsets per joint (rad).
+            turn: Turning signal from left/right rate asymmetry.
+        """
+        if len(motor_rates) == 0:
+            return np.full(6, 0.5), np.zeros((6, 7)), 0.0
+
+        n = len(motor_rates)
+        group_size = max(n // 6, 1)
+
+        leg_rates = np.zeros(6)
+        joint_offsets = np.zeros((6, 7))
+
+        for i in range(6):
+            start = i * group_size
+            end = min(start + group_size, n)
+            if start >= n:
+                leg_rates[i] = np.mean(motor_rates)
+                continue
+            grp = motor_rates[start:end]
+            leg_rates[i] = np.mean(grp)
+
+            # Variance within the group → very subtle joint modulation
+            if len(grp) > 1:
+                var = np.var(grp)
+                # Keep offsets tiny (max ~0.02 rad) and symmetrical
+                # so they don't push legs into unnatural poses
+                offset = np.tanh(var * 0.5) * 0.02
+                # Coxa pitch: slight stride modulation (±)
+                joint_offsets[i, 0] += offset * 0.3
+                # Femur pitch: slight height modulation (±)
+                joint_offsets[i, 3] -= offset * 0.2
+                # Tibia pitch: slight foot placement
+                joint_offsets[i, 5] += offset * 0.15
+
+        # Normalise rates → speed multipliers (keep legs close together)
+        mean_rate = np.mean(motor_rates)
+        if mean_rate > 0.1:
+            leg_speeds = leg_rates / mean_rate
+        else:
+            leg_speeds = np.ones(6)
+        # Tight range: legs stay between 0.4× and 1.6× mean speed
+        leg_speeds = np.clip(0.3 + leg_speeds * self.motor_speed_gain * 200, 0.4, 1.6)
+
+        # Turn from L/R asymmetry (legs 0-2 = left, 3-5 = right)
+        left_rate = np.mean(leg_rates[:3])
+        right_rate = np.mean(leg_rates[3:])
+        turn = np.clip((left_rate - right_rate) * self.motor_turn_gain, -1.0, 1.0)
+
+        return leg_speeds, joint_offsets, turn
+
     # ------------------------------------------------------------------
     # One-step convenience
     # ------------------------------------------------------------------
@@ -352,23 +876,14 @@ def reorder_cpg_to_actuator(
     dof_order = fly.get_actuated_jointdofs_order(actuator_type)
 
     cpg_leg_order = WalkingPatternGenerator.LEG_NAMES  # lf, lm, lh, rf, rm, rh
-    cpg_dof_axes = ["yaw", "pitch", "roll", "pitch", "roll", "pitch", "pitch"]
-    cpg_dof_links = [
-        ("thorax", "coxa"),
-        ("thorax", "coxa"),
-        ("thorax", "coxa"),
-        ("coxa", "trochanterfemur"),
-        ("coxa", "trochanterfemur"),
-        ("trochanterfemur", "tibia"),
-        ("tibia", "tarsus1"),
-    ]
+    # DOF order matches MotionSnippet.dofs_per_leg:
+    # (coxa_pitch, coxa_roll, coxa_yaw, femur_pitch, femur_roll, tibia_pitch, tarsus_pitch)
+    cpg_dof_spec = WalkingPatternGenerator.DOF_SPEC
 
     # Build lookup: (leg_pos, parent_link, child_link, axis) → cpg index
     cpg_lookup: dict[tuple[str, str, str, str], tuple[int, int]] = {}
     for leg_i, leg in enumerate(cpg_leg_order):
-        for dof_j in range(7):
-            parent, child = cpg_dof_links[dof_j]
-            axis = cpg_dof_axes[dof_j]
+        for dof_j, (parent, child, axis) in enumerate(cpg_dof_spec):
             key = (leg, parent, child, axis)
             cpg_lookup[key] = (leg_i, dof_j)
 

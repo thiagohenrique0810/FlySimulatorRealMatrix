@@ -14,6 +14,59 @@ from typing import Sequence
 import numpy as np
 
 
+# ---------------------------------------------------------------------------
+# Known neuron IDs for specific behaviours
+# ---------------------------------------------------------------------------
+
+# Sugar‑sensing gustatory receptor neurons (right hemisphere)
+SUGAR_SENSING_RIGHT_IDS: list[int] = [
+    720575940617937543,
+    720575940621754367,
+    720575940622695448,
+    720575940625815264,
+    720575940613236464,
+    720575940613828302,
+    720575940616553449,
+    720575940620078329,
+    720575940620558198,
+    720575940622002840,
+    720575940624539778,
+    720575940625362705,
+    720575940625815264,
+    720575940626010498,
+    720575940626055890,
+    720575940629257580,
+    720575940631116261,
+    720575940632524076,
+    720575940642181113,
+    720575940657491046,
+    720575940660219265,
+]
+
+# Motor neuron 9 (MN9) – leg motor neuron
+MN9_FLYWIRE_ID: int = 720575940660219265
+
+# SEZ types associated with each behaviour
+WALKING_SEZ_TYPES: list[str] = [
+    "rocket", "basket", "horseshoe", "diatom", "mime",
+    "weaver", "gallinule", "mandala", "brontosaraus", "oink",
+]
+
+GROOMING_SEZ_TYPES: list[str] = [
+    "broom",      # 2 neurons – name implies grooming
+    "whisker",    # 2 neurons – sensory / grooming‑like
+    "handle",     # 4 neurons – manipulative limb motion
+    "earmuff",    # 4 neurons – head‑area related
+]
+
+FEEDING_SEZ_TYPES: list[str] = [
+    "Fdg",            # 2 neurons – likely "feeding"
+    "Salivary_MN13",  # 2 neurons – salivary motor neuron
+    "TPN4",           # 2 neurons – taste projection neuron
+    "FMIn",           # 2 neurons – feeding motor interneuron
+]
+
+
 class Connectome:
     """Interface to the FlyWire v783 connectome.
 
@@ -220,36 +273,3 @@ class Connectome:
         )
         sub_w = self._weights[mask].copy()  # type: ignore
         return sub_pre, sub_post, sub_w, global_to_local
-
-
-# -----------------------------------------------------------------------
-# Well-known neuron IDs from FlyWire literature
-# -----------------------------------------------------------------------
-
-#: Motor neuron MN9 — drives leg muscles (from Shiu et al. example notebook)
-MN9_FLYWIRE_ID = 720575940660219265
-
-#: Sugar-sensing neurons (right hemisphere) — from the example notebook
-SUGAR_SENSING_RIGHT_IDS = [
-    720575940624963786,
-    720575940630233916,
-    720575940637568838,
-    720575940638202345,
-    720575940617000768,
-    720575940630797113,
-    720575940632889389,
-    720575940621754367,
-    720575940621502051,
-    720575940640649691,
-    720575940639332736,
-    720575940616885538,
-    720575940639198653,
-    720575940620900446,
-    720575940617937543,
-    720575940632425919,
-    720575940633143833,
-    720575940612670570,
-    720575940628853239,
-    720575940629176663,
-    720575940611875570,
-]

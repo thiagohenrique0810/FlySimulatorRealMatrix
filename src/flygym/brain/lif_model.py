@@ -62,12 +62,18 @@ class OnlineBrainModel:
         motor_neuron_ids: Sequence[int] | None = None,
         dt_ms: float = 0.1,
         use_subnetwork: bool = False,
+        n_hops: int = 1,
+        max_subnetwork_neurons: int = 50_000,
+        min_hop2_weight: float = 3.0,
         spike_window_ms: float = 50.0,
     ) -> None:
         self.connectome = connectome
         self.params = {**DEFAULT_LIF_PARAMS, **(params or {})}
         self.dt_ms = dt_ms
         self.use_subnetwork = use_subnetwork
+        self.n_hops = n_hops
+        self.max_subnetwork_neurons = max_subnetwork_neurons
+        self.min_hop2_weight = min_hop2_weight
         self.spike_window_ms = spike_window_ms
 
         # Convert FlyWire IDs → global indices
@@ -127,18 +133,47 @@ class OnlineBrainModel:
         # --- Determine which neurons to include ---
         if self.use_subnetwork and (self._sensory_global or self._motor_global):
             seed_indices = set(self._sensory_global + self._motor_global)
-            # Add direct neighbours (1-hop)
             pre = self.connectome.pre_indices
             post = self.connectome.post_indices
-            neighbours: set[int] = set()
-            for idx in seed_indices:
-                # Post-synaptic targets of this neuron
-                mask_pre = pre == idx
-                neighbours.update(int(x) for x in post[mask_pre])
-                # Pre-synaptic sources to this neuron
-                mask_post = post == idx
-                neighbours.update(int(x) for x in pre[mask_post])
-            all_indices = sorted(seed_indices | neighbours)
+            weights = self.connectome.synapse_weights
+
+            current_frontier = set(seed_indices)
+            all_included = set(seed_indices)
+
+            for hop in range(self.n_hops):
+                # For hop >= 2, only keep strong connections
+                weight_threshold = self.min_hop2_weight if hop >= 1 else 0.0
+
+                # Vectorized: find all edges touching the frontier
+                frontier_arr = np.array(sorted(current_frontier), dtype=pre.dtype)
+                # Edges where pre is in frontier
+                pre_mask = np.isin(pre, frontier_arr)
+                # Edges where post is in frontier
+                post_mask = np.isin(post, frontier_arr)
+                if weight_threshold > 0:
+                    strong = np.abs(weights) >= weight_threshold
+                    pre_mask = pre_mask & strong
+                    post_mask = post_mask & strong
+
+                neighbours = set(int(x) for x in post[pre_mask])
+                neighbours.update(int(x) for x in pre[post_mask])
+
+                new_neurons = neighbours - all_included
+                all_included |= new_neurons
+                current_frontier = new_neurons
+
+                if len(all_included) >= self.max_subnetwork_neurons:
+                    break
+
+            all_indices = sorted(all_included)
+            if len(all_indices) > self.max_subnetwork_neurons:
+                # Keep seed neurons + random sample of the rest
+                rest = [i for i in all_indices if i not in seed_indices]
+                keep = self.max_subnetwork_neurons - len(seed_indices)
+                rng = np.random.default_rng(42)
+                rest = list(rng.choice(rest, min(keep, len(rest)), replace=False))
+                all_indices = sorted(list(seed_indices) + rest)
+
             sub_pre, sub_post, sub_w, g2l = self.connectome.extract_subnetwork(
                 all_indices
             )
@@ -205,8 +240,27 @@ class OnlineBrainModel:
         # --- Spike monitor ---
         spk_mon = SpikeMonitor(neu)
 
+        # --- Background Poisson noise (spontaneous activity) ---
+        # All neurons receive random excitatory input simulating
+        # activity from brain regions not in the subnetwork.
+        # With tau=5ms, mean(g) = rate * weight * tau.
+        # Threshold gap = v_th - v_0 = 7 mV.
+        # Target: mean(g) ≈ 6 mV (1 mV below threshold) so ~15-20%
+        # of neurons fire from fluctuations alone.
+        bg_rate = p.get("bg_poisson_rate", 600.0)  # Hz per neuron
+        bg_weight = p.get("bg_poisson_weight", 2.0)  # mV
+        from brian2 import PoissonGroup
+        poisson_bg = PoissonGroup(self._n_neurons, rates=bg_rate * Hz)
+        bg_syn = Synapses(
+            poisson_bg, neu,
+            on_pre="g += bg_w",
+            name="background_synapses",
+            namespace={"bg_w": bg_weight * mV},
+        )
+        bg_syn.connect("i == j")  # one-to-one
+
         # --- Assemble network ---
-        self._net = Network(neu, syn, spk_mon)
+        self._net = Network(neu, syn, spk_mon, poisson_bg, bg_syn)
         self._neu = neu
         self._spk_mon = spk_mon
         self._spike_history.clear()
@@ -264,6 +318,29 @@ class OnlineBrainModel:
         for local_idx, current in zip(self._sensory_local, currents_mv):
             self._neu[local_idx].I_ext = current * mV
 
+    def inject_motor_current(
+        self,
+        indices: list[int],
+        current_mv: float,
+    ) -> None:
+        """Inject extra current into specific motor neurons.
+
+        Used to simulate descending commands from brain regions not
+        included in the subnetwork (e.g., higher-order decision circuits).
+
+        Args:
+            indices: Local indices into the motor neuron array (slots in
+                ``motor_neuron_ids`` order).
+            current_mv: Current to add (mV). Adds on top of existing I_ext.
+        """
+        if self._neu is None:
+            return
+        from brian2 import mV
+        for slot in indices:
+            if 0 <= slot < len(self._motor_local):
+                local_idx = self._motor_local[slot]
+                self._neu[local_idx].I_ext += current_mv * mV
+
     def get_motor_spike_rates(self) -> np.ndarray:
         """Compute instantaneous firing rates (Hz) for motor neurons.
 
@@ -294,6 +371,17 @@ class OnlineBrainModel:
         for neu_idx, _ in self._spike_history:
             counts[neu_idx] = counts.get(neu_idx, 0) + 1
         return {k: v / max(window_sec, 1e-9) for k, v in counts.items()}
+
+    def get_all_spike_rates_array(self) -> np.ndarray:
+        """Firing rates (Hz) for every neuron as a dense array.
+
+        Returns:
+            Array of shape ``(n_neurons,)`` with rates in Hz.
+        """
+        rates = np.zeros(self._n_neurons, dtype=np.float32)
+        for idx, rate in self.get_all_spike_rates().items():
+            rates[idx] = rate
+        return rates
 
     def reset(self) -> None:
         """Reset the brain model to its initial state."""
