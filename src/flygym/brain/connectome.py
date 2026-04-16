@@ -66,6 +66,45 @@ FEEDING_SEZ_TYPES: list[str] = [
     "FMIn",           # 2 neurons – feeding motor interneuron
 ]
 
+# Olfactory-related SEZ types (flower-named neuron types —
+# repurposed as olfaction-to-motor relay for odor search behaviour)
+OLFACTORY_SEZ_TYPES: list[str] = [
+    "hyacinth",   # 6 neurons – flower-named, sensory integration
+    "foxglove",   # 2 neurons – flower-named
+    "tulip",      # 2 neurons – flower-named
+    "rose",       # 1 neuron  – flower-named
+    "bluebell",   # 2 neurons – flower-named
+    "peacock",    # 3 neurons – sensory integration
+]
+
+# Proxy olfactory receptor neurons — sensory-like neurons
+# (very few inputs, many outputs) that serve as stand-ins for
+# ORNs since the connectome lacks cell-type annotations.
+# Selected from neurons with ≤3 inputs and ≥47 outputs
+# (same connectivity profile as real ORNs).
+OLFACTORY_PROXY_IDS: list[int] = [
+    720575940612522646,
+    720575940619003969,
+    720575940633284276,
+    720575940615110450,
+    720575940621765813,
+    720575940621708981,
+    720575940637321847,
+    720575940624822003,
+    720575940608366722,
+    720575940622097959,
+    720575940612857055,
+    720575940622051393,
+    720575940606303755,
+    720575940623405948,
+    720575940611268266,
+    720575940622674504,
+    720575940625865724,
+    720575940635697380,
+    720575940629561400,
+    720575940625429647,
+]
+
 
 class Connectome:
     """Interface to the FlyWire v783 connectome.

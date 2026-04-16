@@ -14,7 +14,8 @@ from pathlib import Path
 import numpy as np
 import mujoco.viewer
 
-from flygym.compose import Fly, KinematicPosePreset, ActuatorType, FlatGroundWorld
+from flygym.compose import Fly, KinematicPosePreset, ActuatorType
+from flygym.brain.nature_world import NatureWorld
 from flygym.anatomy import Skeleton, AxisOrder, JointPreset, ActuatedDOFPreset
 from flygym.utils.math import Rotation3D
 from flygym import Simulation
@@ -106,7 +107,7 @@ def main() -> None:
     fly.colorize()
     fly.add_tracking_camera()
 
-    world = FlatGroundWorld()
+    world = NatureWorld()
     world.add_fly(fly, [0, 0, 0.7],
                   Rotation3D(format="quat", values=[1, 0, 0, 0]))
 
@@ -186,6 +187,8 @@ def main() -> None:
         step_idx = 0
         last_behavior = None
         last_event = None
+        import time as _time
+        _brain_times = []
 
         while viewer.is_running():
             for _ in range(viewer_sync_interval):
@@ -193,6 +196,7 @@ def main() -> None:
 
                 # --- Brain update ---
                 if step_idx % brain_update_interval == 0:
+                    _t0 = _time.perf_counter()
                     # 1) Read body sensors
                     joint_angles = sim.get_joint_angles(fly_name)
                     contact_info = sim.get_ground_contact_info(fly_name)
@@ -224,8 +228,14 @@ def main() -> None:
                     brain.inject_sensory_current(currents)
                     brain.step(brain_dt_ms)
 
+                    _brain_times.append(_time.perf_counter() - _t0)
+                    if len(_brain_times) % 10 == 0:
+                        avg = sum(_brain_times[-10:]) / 10
+                        print(f"  [PERF] brain step avg: {avg*1000:.0f} ms  "
+                              f"(sim {t:.2f}s after {len(_brain_times)} updates)")
+
                     # 5) Brain decides behaviour
-                    current_behavior = beh_ctrl.update(brain_dt_ms * 1e-3)
+                    current_behavior = beh_ctrl.update(brain_dt_ms * 1e-3, event=ev)
 
                     # 6) Per-leg motor control
                     motor_rates = brain.get_motor_spike_rates()

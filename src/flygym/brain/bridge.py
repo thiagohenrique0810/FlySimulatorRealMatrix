@@ -193,6 +193,7 @@ class BehaviorState(Enum):
     WALKING = "walking"
     GROOMING = "grooming"
     FEEDING = "feeding"
+    SEARCHING = "searching"
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +351,70 @@ class FeedingProgram:
 
 
 # ---------------------------------------------------------------------------
+# Odor search programme — chemotaxis-inspired zigzag walk
+# ---------------------------------------------------------------------------
+
+
+class OdorSearchProgram:
+    """Generates odor-tracking search behaviour.
+
+    When the fly detects an odor, it performs a chemotaxis-inspired
+    pattern: moderate-speed walking with alternating left/right turns
+    (casting) to locate the odor source.  The antenna oscillate slightly
+    as if sampling the air.
+
+    Args:
+        cast_freq: Frequency of left-right casting turns (Hz).
+        cast_amplitude: Maximum turn magnitude during casting.
+    """
+
+    LEG_NAMES = WalkingPatternGenerator.LEG_NAMES
+    DOF_SPEC = WalkingPatternGenerator.DOF_SPEC
+
+    def __init__(
+        self, cast_freq: float = 1.5, cast_amplitude: float = 0.6
+    ) -> None:
+        self.cast_freq = cast_freq
+        self.cast_amplitude = cast_amplitude
+        self._cpg = WalkingPatternGenerator()
+        self._cast_phase: float = 0.0
+
+    def step(
+        self, dt: float, speed: float = 0.6, turn: float = 0.0
+    ) -> np.ndarray:
+        """Advance odor-search motion.
+
+        Returns:
+            Joint angles ``(6, 7)``.
+        """
+        self._cast_phase += dt * self.cast_freq * 2.0 * np.pi
+
+        # Casting turn: sinusoidal left-right sweeps
+        cast_turn = self.cast_amplitude * np.sin(self._cast_phase)
+        total_turn = np.clip(turn + cast_turn, -1.0, 1.0)
+
+        angles = self._cpg.step(dt, speed=speed, turn=total_turn)
+
+        # Subtle antenna sampling: front legs lift slightly during casting peaks
+        cast_mag = abs(np.sin(self._cast_phase))
+        if cast_mag > 0.8:
+            lift = (cast_mag - 0.8) / 0.2  # 0→1
+            for i in [0, 3]:  # lf, rf
+                angles[i, 0] += 0.10 * lift   # coxa pitch forward (antenna reach)
+                angles[i, 3] += 0.15 * lift   # femur pitch up slightly
+
+        return angles
+
+    def get_adhesion_states(self) -> np.ndarray:
+        """During searching, use normal walking adhesion."""
+        return self._cpg.get_adhesion_states()
+
+    def reset(self) -> None:
+        self._cpg.reset()
+        self._cast_phase = 0.0
+
+
+# ---------------------------------------------------------------------------
 # Behaviour controller — brain-driven behaviour switching
 # ---------------------------------------------------------------------------
 
@@ -357,11 +422,12 @@ class FeedingProgram:
 class BehaviorController:
     """Selects the active behaviour based on brain neuron group activity.
 
-    Three pools of neurons in the brain are monitored:
+    Four pools of neurons in the brain are monitored:
 
     * **Walking pool** — high activity → keep walking
     * **Grooming pool** — high activity → antenna grooming
     * **Feeding pool** — high activity → food seeking
+    * **Olfactory pool** — high activity → odor search (chemotaxis)
 
     The pool with the highest normalised firing rate wins.  A minimum
     hold duration prevents rapid flickering between behaviours.
@@ -372,6 +438,7 @@ class BehaviorController:
         walking_ids: FlyWire IDs for walking-related neurons.
         grooming_ids: FlyWire IDs for grooming-related neurons.
         feeding_ids: FlyWire IDs for feeding-related neurons.
+        olfactory_ids: FlyWire IDs for olfaction-related neurons.
         hold_time_s: Minimum time (seconds) to stay in a behaviour.
         grooming_threshold: Minimum rate (Hz) for grooming to activate.
         feeding_threshold: Minimum rate (Hz) for feeding to activate.
@@ -384,6 +451,7 @@ class BehaviorController:
         walking_ids: list[int],
         grooming_ids: list[int],
         feeding_ids: list[int],
+        olfactory_ids: list[int] | None = None,
         *,
         hold_time_s: float = 1.0,
         grooming_threshold: float = 0.8,
@@ -399,9 +467,11 @@ class BehaviorController:
         self._walking_local = self._resolve_ids(walking_ids)
         self._grooming_local = self._resolve_ids(grooming_ids)
         self._feeding_local = self._resolve_ids(feeding_ids)
+        self._olfactory_local = self._resolve_ids(olfactory_ids or [])
 
         self._state = BehaviorState.WALKING
         self._state_timer: float = 0.0
+        self._current_event: str = "baseline"
 
     def _resolve_ids(self, fly_ids: list[int]) -> list[int]:
         """Convert FlyWire IDs to indices in the motor_rates array.
@@ -429,45 +499,59 @@ class BehaviorController:
     def state(self) -> BehaviorState:
         return self._state
 
-    def update(self, dt: float) -> BehaviorState:
+    def update(self, dt: float, event: str = "baseline") -> BehaviorState:
         """Evaluate brain activity and return the active behaviour.
+
+        Hybrid approach: the environmental event **gates** which behaviour
+        pools are candidates, but the brain must **confirm** the switch
+        by showing excess neural activity in the relevant pool above
+        the motor-neuron baseline.  This prevents Poisson background
+        noise from causing false switches while keeping the brain in
+        the decision loop.
 
         Args:
             dt: Elapsed time since last call (seconds).
+            event: Current environment event name.
         """
         self._state_timer += dt
+        self._current_event = event
 
         # Check hold time
         if self._state_timer < self.hold_time_s:
             return self._state
 
+        # --- Compute pool excess over motor baseline ---
         motor_rates = self.brain.get_motor_spike_rates()
         if len(motor_rates) == 0:
             return self._state
 
-        walk_rate = self._pool_rate(motor_rates, self._walking_local)
-        groom_rate = self._pool_rate(motor_rates, self._grooming_local)
-        feed_rate = self._pool_rate(motor_rates, self._feeding_local)
+        baseline = float(np.mean(motor_rates)) if len(motor_rates) > 0 else 0.0
 
-        # Normalise by pool size — smaller pools (grooming=10, feeding=5)
-        # would always lose to walking (99) in absolute rate.
-        # Scale so all pools compete fairly.
-        n_walk = max(len(self._walking_local), 1)
-        n_groom = max(len(self._grooming_local), 1)
-        n_feed = max(len(self._feeding_local), 1)
-        ref_size = (n_walk + n_groom + n_feed) / 3.0
-        walk_score = walk_rate * (ref_size / n_walk)
-        groom_score = groom_rate * (ref_size / n_groom)
-        feed_score = feed_rate * (ref_size / n_feed)
+        groom_excess = max(
+            self._pool_rate(motor_rates, self._grooming_local) - baseline, 0.0
+        )
+        feed_excess = max(
+            self._pool_rate(motor_rates, self._feeding_local) - baseline, 0.0
+        )
+        olfactory_excess = max(
+            self._pool_rate(motor_rates, self._olfactory_local) - baseline, 0.0
+        )
 
+        # --- Hybrid decision ---
+        # Event gates the candidate; brain confirms with excess activity.
+        # A small minimum (1.0 Hz) prevents switching on pure noise,
+        # but is easy to reach when the event injects real current.
+        min_confirm_hz = 1.0
         new_state = self._state
 
-        # Priority: grooming > feeding > walking
-        if groom_score >= self.grooming_threshold and groom_score > walk_score * 0.5:
+        if event == "antenna_irritation" and groom_excess >= min_confirm_hz:
             new_state = BehaviorState.GROOMING
-        elif feed_score >= self.feeding_threshold and feed_score > walk_score * 0.3:
+        elif event == "sugar_detection" and feed_excess >= min_confirm_hz:
             new_state = BehaviorState.FEEDING
-        else:
+        elif event == "odor_detection" and olfactory_excess >= min_confirm_hz:
+            new_state = BehaviorState.SEARCHING
+        elif event == "baseline":
+            # No event active → return to walking
             new_state = BehaviorState.WALKING
 
         if new_state != self._state:
@@ -488,6 +572,7 @@ class BehaviorController:
     def reset(self) -> None:
         self._state = BehaviorState.WALKING
         self._state_timer = 0.0
+        self._current_event = "baseline"
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +595,8 @@ class SensoryEventGenerator:
           neurons → drives grooming neuron pools
         * **sugar_detection** — strong excitation of gustatory/sugar-sensing
           neurons → drives feeding neuron pools
+        * **odor_detection** — moderate excitation of olfactory proxy
+          neurons → drives chemotaxis search behaviour
         * **baseline** — moderate tonic excitation → walking
 
     Args:
@@ -518,6 +605,7 @@ class SensoryEventGenerator:
         event_duration_s: How long each event persists.
         irritation_strength_mv: Extra current for antenna irritation (mV).
         sugar_strength_mv: Extra current for sugar detection (mV).
+        odor_strength_mv: Extra current for odor detection (mV).
         seed: Random seed for reproducibility.
     """
 
@@ -529,6 +617,7 @@ class SensoryEventGenerator:
         event_duration_s: float = 2.0,
         irritation_strength_mv: float = 25.0,
         sugar_strength_mv: float = 20.0,
+        odor_strength_mv: float = 22.0,
         seed: int | None = None,
     ) -> None:
         self.n_sensory = n_sensory
@@ -536,6 +625,7 @@ class SensoryEventGenerator:
         self.event_duration_s = event_duration_s
         self.irritation_strength_mv = irritation_strength_mv
         self.sugar_strength_mv = sugar_strength_mv
+        self.odor_strength_mv = odor_strength_mv
         self._rng = np.random.default_rng(seed)
 
         self._current_event: str = "baseline"
@@ -566,26 +656,38 @@ class SensoryEventGenerator:
             if self._event_timer >= self._next_event_at:
                 # Pick random event type
                 r = self._rng.random()
-                if r < 0.45:
+                if r < 0.35:
                     self._current_event = "antenna_irritation"
-                elif r < 0.9:
+                elif r < 0.65:
                     self._current_event = "sugar_detection"
+                elif r < 0.90:
+                    self._current_event = "odor_detection"
                 else:
                     self._current_event = "baseline"  # false alarm
                 self._event_timer = 0.0
 
         # Build stimulus based on current event
         if self._current_event == "antenna_irritation":
-            # Stimulate mechano-sensory group (first third of sensory neurons)
-            group = max(self.n_sensory // 3, 1)
+            # Stimulate mechano-sensory group (first quarter of sensory neurons)
+            group = max(self.n_sensory // 4, 1)
             # Ramp up then plateau
             ramp = min(self._event_timer / 0.3, 1.0)
             extra[:group] = self.irritation_strength_mv * ramp
         elif self._current_event == "sugar_detection":
-            # Stimulate gustatory group (last third of sensory neurons)
-            group = max(self.n_sensory // 3, 1)
+            # Stimulate gustatory group (second quarter of sensory neurons)
+            group = max(self.n_sensory // 4, 1)
             ramp = min(self._event_timer / 0.3, 1.0)
-            extra[-group:] = self.sugar_strength_mv * ramp
+            start = max(self.n_sensory // 4, 1)
+            extra[start:start + group] = self.sugar_strength_mv * ramp
+        elif self._current_event == "odor_detection":
+            # Stimulate olfactory group (last half of sensory neurons)
+            # Olfactory has more neurons → stimulate broader group
+            group = max(self.n_sensory // 2, 1)
+            # Odor: slower ramp (diffusion-like), with fluctuations
+            ramp = min(self._event_timer / 0.5, 1.0)
+            # Add concentration fluctuations (turbulent plume)
+            fluct = 0.7 + 0.3 * np.sin(self._event_timer * 8.0)
+            extra[-group:] = self.odor_strength_mv * ramp * fluct
 
         return extra
 

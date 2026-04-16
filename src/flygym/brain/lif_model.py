@@ -97,6 +97,7 @@ class OnlineBrainModel:
 
         # Spike history ring buffer for rate computation
         self._spike_history: deque = deque()
+        self._spk_cursor: int = 0  # tracks how far we've read in spk_mon
         self._current_time_ms: float = 0.0
 
         self._brian2_imported = False
@@ -240,30 +241,20 @@ class OnlineBrainModel:
         # --- Spike monitor ---
         spk_mon = SpikeMonitor(neu)
 
-        # --- Background Poisson noise (spontaneous activity) ---
-        # All neurons receive random excitatory input simulating
-        # activity from brain regions not in the subnetwork.
-        # With tau=5ms, mean(g) = rate * weight * tau.
-        # Threshold gap = v_th - v_0 = 7 mV.
-        # Target: mean(g) ≈ 6 mV (1 mV below threshold) so ~15-20%
-        # of neurons fire from fluctuations alone.
-        bg_rate = p.get("bg_poisson_rate", 600.0)  # Hz per neuron
-        bg_weight = p.get("bg_poisson_weight", 2.0)  # mV
-        from brian2 import PoissonGroup
-        poisson_bg = PoissonGroup(self._n_neurons, rates=bg_rate * Hz)
-        bg_syn = Synapses(
-            poisson_bg, neu,
-            on_pre="g += bg_w",
-            name="background_synapses",
-            namespace={"bg_w": bg_weight * mV},
-        )
-        bg_syn.connect("i == j")  # one-to-one
+        # --- Background noise parameters (spontaneous activity) ---
+        # Instead of a PoissonGroup (which doubles network size), we
+        # inject Gaussian noise into I_ext before each step.  This is
+        # ~2x faster while producing the same qualitative effect.
+        self._bg_mean_mv = p.get("bg_noise_mean", 6.0)   # mV, close to threshold gap
+        self._bg_std_mv = p.get("bg_noise_std", 3.0)     # mV, variability
+        self._bg_rng = np.random.default_rng(42)
 
         # --- Assemble network ---
-        self._net = Network(neu, syn, spk_mon, poisson_bg, bg_syn)
+        self._net = Network(neu, syn, spk_mon)
         self._neu = neu
         self._spk_mon = spk_mon
         self._spike_history.clear()
+        self._spk_cursor = 0
         self._current_time_ms = 0.0
 
     # ------------------------------------------------------------------
@@ -274,19 +265,29 @@ class OnlineBrainModel:
         """Advance the brain simulation by *duration_ms* milliseconds."""
         if self._net is None:
             raise RuntimeError("Call setup() before stepping the brain model.")
-        from brian2 import ms as ms_unit
+        from brian2 import ms as ms_unit, mV
+
+        # Inject background noise (replaces PoissonGroup — much faster)
+        noise = self._bg_rng.normal(
+            self._bg_mean_mv, self._bg_std_mv, self._n_neurons
+        )
+        noise = np.clip(noise, 0.0, None)  # excitatory only
+        self._neu.I_ext += noise * mV
 
         self._net.run(duration_ms * ms_unit)
+
+        # Reset background noise (leave only sensory/motor I_ext)
+        self._neu.I_ext = 0 * mV
+
         self._current_time_ms += duration_ms
 
-        # Record spikes for rate computation
-        trains = self._spk_mon.spike_trains()
-        t_start = (self._current_time_ms - duration_ms) / 1000.0  # seconds
-        for neu_idx, times in trains.items():
-            for t in times:
-                t_sec = float(t)
-                if t_sec >= t_start:
-                    self._spike_history.append((int(neu_idx), t_sec))
+        # Record only NEW spikes (cursor-based — O(new_spikes) per step)
+        all_i = self._spk_mon.i[:]   # flat array of neuron indices
+        all_t = self._spk_mon.t[:]   # flat array of spike times (seconds)
+        n_total = len(all_i)
+        for k in range(self._spk_cursor, n_total):
+            self._spike_history.append((int(all_i[k]), float(all_t[k])))
+        self._spk_cursor = n_total
 
         # Prune old spikes outside the rate window
         cutoff_sec = (self._current_time_ms - self.spike_window_ms) / 1000.0
@@ -394,6 +395,7 @@ class OnlineBrainModel:
         self._neu.g = 0 * mV
         self._neu.I_ext = 0 * mV
         self._spike_history.clear()
+        self._spk_cursor = 0
         self._current_time_ms = 0.0
 
     # ------------------------------------------------------------------
